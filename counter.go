@@ -7,11 +7,25 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 )
 
-func processConnection(c net.Conn, storage map[uint32]uint32) {
+type Storage map[uint32]uint32
+type DoneChannel chan struct{}
+type DataChannel chan uint32
+
+type RedisTask struct {
+	client  *redis.Client
+	ticker  *time.Ticker
+	storage Storage
+	data    DataChannel
+	done    DoneChannel
+}
+
+func processConnection(c net.Conn, dataChannel DataChannel) {
 	for {
 		buf := make([]byte, 4)
 		nr, err := c.Read(buf)
@@ -23,30 +37,44 @@ func processConnection(c net.Conn, storage map[uint32]uint32) {
 		projectId := binary.LittleEndian.Uint32(data)
 		log.Println("Visited project id", projectId)
 
-		storage[projectId] = uint32(time.Now().Unix())
+		dataChannel <- projectId
 	}
 }
 
-func saveDataToRedis(client *redis.Client, storage map[uint32]uint32) {
-	if len(storage) > 0 {
-		pairs := make([]string, len(storage)*2)
-		var n uint32 = 0
+func (t *RedisTask) Save() {
+	if len(t.storage) == 0 {
+		return
+	}
 
-		for projectId, timestamp := range storage {
-			pairs[n] = strconv.Itoa(int(projectId))
-			pairs[n+1] = strconv.Itoa(int(timestamp))
-			n += 2
-			delete(storage, projectId)
+	pairs := make([]string, len(t.storage)*2)
+	var n uint32 = 0
+
+	for projectId, timestamp := range t.storage {
+		pairs[n] = strconv.Itoa(int(projectId))
+		pairs[n+1] = strconv.Itoa(int(timestamp))
+		n += 2
+		delete(t.storage, projectId)
+	}
+
+	log.Println("Saving data to redis", pairs)
+	t.client.MSet(pairs)
+}
+
+func (t *RedisTask) Run(flushInterval int) {
+	t.storage = make(Storage)
+	t.ticker = time.NewTicker(time.Second * time.Duration(flushInterval))
+	defer t.ticker.Stop()
+
+	for {
+		select {
+		case projectId := <-t.data:
+			t.storage[projectId] = uint32(time.Now().Unix())
+		case <-t.ticker.C:
+			t.Save()
+		case <-t.done:
+			t.Save()
+			os.Exit(1)
 		}
-
-		log.Println("Saving data to redis", pairs)
-		client.MSet(pairs)
-	}
-}
-
-func saveDataToRedisTicker(client *redis.Client, ticker *time.Ticker, storage map[uint32]uint32) {
-	for range ticker.C {
-		saveDataToRedis(client, storage)
 	}
 }
 
@@ -58,13 +86,12 @@ func main() {
 	flag.Parse()
 	socketName := *socketNamePtr
 
-	storage := make(map[uint32]uint32)
-
 	// Connect to Redis
 	client := redis.NewClient(&redis.Options{
 		Addr: *redisAddrPtr,
 		DB:   *redisDbPtr,
 	})
+	defer client.Close()
 	log.Println("Connected to redis", *redisAddrPtr)
 
 	// Listen to socket
@@ -79,12 +106,26 @@ func main() {
 	defer l.Close()
 	log.Println("Listening to socket", socketName)
 
-	// Init timer
-	timer := time.NewTicker(time.Second * time.Duration(*flushIntervalPtr))
-	go saveDataToRedisTicker(client, timer, storage)
-	defer timer.Stop()
-	defer saveDataToRedis(client, storage)
-	defer client.Close()
+	// Listen to CTRL+C and SIGTERM
+	doneChannel := make(DoneChannel)
+	go func() {
+		c := make(chan os.Signal, 1)
+		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+		sig := <-c
+		log.Printf("Got %s signal. Aborting...\n", sig)
+		close(doneChannel)
+	}()
+
+	// Create data channel for interchange between goroutines
+	dataChannel := make(DataChannel)
+
+	// Init Redis task
+	redisTask := &RedisTask{
+		client: client,
+		data:   dataChannel,
+		done:   doneChannel,
+	}
+	go redisTask.Run(*flushIntervalPtr)
 
 	for {
 		con, err := l.Accept()
@@ -92,6 +133,6 @@ func main() {
 			log.Fatal("accept error:", err)
 		}
 
-		go processConnection(con, storage)
+		go processConnection(con, dataChannel)
 	}
 }
